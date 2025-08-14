@@ -1,0 +1,135 @@
+bq query --nouse_legacy_sql   "select
+ event_time as event_time,
+'ericsson' as  vendor,
+fqdn,
+labels,
+KEY as metric_name,
+safe_cast(increase_value as bignumeric) as metric_increase_value,
+safe_cast(sum_value as bignumeric) as metric_sum_value,
+safe_cast(p_90 as bignumeric) as metric_p_90_value,
+safe_cast(sum_by_value as bignumeric) as metric_sum_by_value,
+trans_dt,
+datetime(current_timestamp()) as schedule_time,
+current_timestamp as updated_timestamp
+from
+(
+WITH  base_data AS (
+  select *,
+  MD5(labels) as checksum
+  from (
+---- Round timestamp down to the nearest hour bucket
+  SELECT
+  distinct trans_hr as event_time,
+  fqdn,
+---- clean and normalize label JSON by removing unnecessary fields
+   TO_JSON_STRING(struct(
+  json_value(labels,'$.NFType')as NFType,
+   json_value(labels,'$.app_kubernetes_io_name')as app_kubernetes_io_name,
+    json_value(labels,'$.Method')as Method,
+     json_value(labels,'$.StatusCode')as StatusCode
+)) as labels,
+   JSON_VALUE(labels,'$.instance') as instance,
+    lower(name) as KEY,
+    SAFE_CAST(nullif(value,'NaN') AS FLOAT64) AS value,
+    DATE(timestamp) AS trans_dt,
+    timestamp
+  FROM
+    vz-it-np-gudv-dev-dtwndo-0.aid_nwperf_aether_core_tbls.oracle_cnf_scp_raw_v1_temp
+---- Filter data that belongs to the event window
+    WHERE trans_hr in ('2025-08-11 01:00:00' ,'2025-08-11 2:00:00','2025-08-11 3:00:00')
+      and trans_dt is not null
+)
+),
+---- identify metric resets using lag function
+window_data AS (
+---- Check if value has reset comparing it to the previous value
+select *,if(value<prev_value,1,0) has_reset,FIRST_VALUE(value) OVER (
+        PARTITION BY trans_dt, event_time, fqdn,instance, checksum, KEY
+        ORDER BY timestamp DESC
+      ) AS sum_by_value from (
+select
+   trans_dt,
+   event_time,
+   fqdn,
+   labels,
+   checksum,
+   instance,
+   KEY,
+   value,
+   timestamp,
+---- Apply lag logic to get previous value for each metric_name,fqdn, checksum and instance combination in case of reset and calculate increase value
+   SAFE_CAST(LAG(value) OVER (PARTITION BY fqdn, instance, checksum, KEY, DATETIME_TRUNC(timestamp,HOUR) ORDER BY timestamp) AS FLOAT64) AS prev_value
+from base_data
+)
+),
+  reset_adjusted AS (
+  SELECT
+    event_time,
+    fqdn,
+    instance,
+    trans_dt,
+    MAX(labels) AS labels,
+    checksum,
+    KEY,
+    sum(value) as sum_value,---- sum all the values over the hour
+    SUM(CASE
+        WHEN prev_value is NULL THEN 0 ---- skip first record of each partition
+        WHEN has_reset =1 THEN value   ---- full value if reset occured
+        ELSE value - IFNULL(prev_value,0)-- Difference otherwise
+    END
+      ) AS increase_value,
+---- Approximate 90th percentile from the value distribution
+    APPROX_QUANTILES(value, 100)[OFFSET(90)] as p_90,
+    sum_by_value
+  FROM
+    window_data
+  GROUP BY
+   trans_dt,
+   event_time,
+   instance,
+   fqdn,
+   sum_by_value,
+   checksum,
+   KEY )
+---- Aggregate instance level to get total increase/sum/p_90 value per metric and fqdn 
+SELECT
+  event_time,
+  fqdn,
+  trans_dt,
+  SAFE.PARSE_JSON(labels)  AS labels,---- convert labels string back to JSON object
+  checksum,
+  KEY,
+  increase_value,
+  sum_value,
+  p_90,
+  sum_by_value
+FROM (
+  SELECT
+  event_time,
+  fqdn,
+  trans_dt,
+  labels,
+  checksum,
+  KEY,
+---- Final aggregation for metrics
+  SUM(increase_value) AS increase_value,
+  SUM(sum_value) AS sum_value,
+  sum(p_90) as p_90,
+  sum(sum_by_value) as sum_by_value
+FROM
+  reset_adjusted
+GROUP BY   
+  event_time,
+  fqdn,
+  trans_dt,
+  labels,  
+  checksum,
+  KEY
+)
+ORDER BY
+  trans_dt,
+  event_time,
+  fqdn,
+  checksum,
+  KEY
+  )"
